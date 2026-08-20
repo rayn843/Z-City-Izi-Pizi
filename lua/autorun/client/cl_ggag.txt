@@ -1,0 +1,512 @@
+-- Параметры высокого разрешения для финального рендера
+local HIGH_RES_Y = 1080
+local HIGH_RES_X = math.floor(HIGH_RES_Y * ScrW() / ScrH())
+
+surface.CreateFont("DebugFont", {
+    font = "Arial",
+    size = 16,
+    weight = 500,
+})
+
+-- Ультра-низкое разрешение для реалтайма
+local RES_Y = 150
+local RES_X = math.floor(RES_Y * ScrW() / ScrH())
+
+-- RTX-эффекты
+local reflectivity = 0.35 
+local specular_power = 16
+local specular_strength = 0.3
+
+-- Камера и освещение
+local cam_x, cam_y, cam_z = 0, 0, 0
+local cam_forward_x, cam_forward_y, cam_forward_z = 0, 1, 0
+local cam_right_x, cam_right_y, cam_right_z = 1, 0, 0
+local cam_up_x, cam_up_y, cam_up_z = 0, 0, 1
+local focal_length = 1.3
+local current_light_x, current_light_y, current_light_z = 0, 0, 0
+
+-- ОПТИМИЗАЦИЯ: Локализация встроенных функций
+local m_floor = math.floor
+local m_sqrt = math.sqrt
+local m_sin = math.sin
+local m_cos = math.cos
+local m_Clamp = math.Clamp
+local util_TraceLine = util.TraceLine
+local surface_SetDrawColor = surface.SetDrawColor
+local surface_DrawRect = surface.DrawRect
+local surface_SetMaterial = surface.SetMaterial
+local surface_DrawTexturedRect = surface.DrawTexturedRect
+local render_PushRenderTarget = render.PushRenderTarget
+local render_PopRenderTarget = render.PopRenderTarget
+local cam_Start2D = cam.Start2D
+local cam_End2D = cam.End2D
+local draw_SimpleText = draw.SimpleText
+local string_byte = string.byte
+local math_random = math.random
+local SysTime = SysTime
+local FrameNumber = FrameNumber
+
+local rt = nil
+local mat = nil
+local lcx, lcy, lcz = 0, 0, 0
+
+-- ==================== ОПТИМИЗАЦИЯ: ПРЕДВАРИТЕЛЬНОЕ ВЫДЕЛЕНИЕ ПАМЯТИ ====================
+local tr_start_vec = Vector(0, 0, 0)
+local tr_endpos_vec = Vector(0, 0, 0)
+local tr_data = { start = tr_start_vec, endpos = tr_endpos_vec, mask = MASK_SOLID_BRUSHONLY }
+
+local sh_tr_start_vec = Vector(0, 0, 0)
+local sh_tr_endpos_vec = Vector(0, 0, 0)
+local sh_tr_data = { start = sh_tr_start_vec, endpos = sh_tr_endpos_vec, mask = MASK_SOLID_BRUSHONLY }
+
+local texture_color_cache = {}
+local hq_spans_buffer = {} 
+
+-- ОПТИМИЗАЦИЯ: Предвычисленный шум для сохранения JIT-компиляции
+local jitter_table = {}
+for i = 1, 1024 do 
+    jitter_table[i] = math_random() - 0.5 
+end
+local j_idx = 1
+
+local g_render = {
+    active = false,
+    co = nil,
+    snap = nil,
+    rt = nil,
+    mat = nil,
+    rows_done = 0,
+    total_rows = HIGH_RES_Y,
+    finished = false,
+    requested = false
+}
+
+if not rtx_aa_samples_var then
+    rtx_aa_samples_var = CreateConVar("rtx_aa_samples", "1", FCVAR_ARCHIVE, "AA samples (1,2,4)")
+end
+
+-- ==================== КОМАНДА ДЛЯ HQ СНИМКА ====================
+concommand.Add("rtx_snapshot", function()
+    if g_render.active then
+        print("RTX: Уже идет рендеринг, подождите...")
+        return
+    end
+    g_render.requested = true
+    print("RTX: Начат рендеринг снимка в высоком разрешении...")
+end)
+
+-- ==================== СИСТЕМА ТРАССИРОВКИ ====================
+
+local function trace_map(ox, oy, oz, dx, dy, dz, len)
+    if len < 1e-6 then return nil end
+    
+    tr_start_vec.x = ox; tr_start_vec.y = oy; tr_start_vec.z = oz
+    local scale = 20000 / len
+    tr_endpos_vec.x = ox + dx * scale
+    tr_endpos_vec.y = oy + dy * scale
+    tr_endpos_vec.z = oz + dz * scale
+
+    local tr = util_TraceLine(tr_data)
+
+    if tr.Hit and not tr.StartSolid then
+        return tr.HitNormal.x, tr.HitNormal.y, tr.HitNormal.z, tr.HitPos.x, tr.HitPos.y, tr.HitPos.z, tr.HitTexture
+    end
+    return nil
+end
+
+local function get_map_color(hx, hy, hz, texture_name)
+    local inv_scale = 1 / 48
+    local cx = m_floor(hx * inv_scale) % 2
+    local cy = m_floor(hy * inv_scale) % 2
+    local cz = m_floor(hz * inv_scale) % 2
+    local checker = (cx + cy + cz) % 2 == 0
+
+    local r, g, b = 140, 140, 140
+    if texture_name then
+        local cached = texture_color_cache[texture_name]
+        if not cached then
+            local hash = 0
+            for i = 1, #texture_name do
+                hash = hash + string_byte(texture_name, i)
+            end
+            cached = {
+                (hash * 43) % 130 + 70,
+                (hash * 79) % 130 + 70,
+                (hash * 113) % 130 + 70
+            }
+            texture_color_cache[texture_name] = cached
+        end
+        r, g, b = cached[1], cached[2], cached[3]
+    end
+
+    if checker then
+        return r * 0.8, g * 0.8, b * 0.8
+    else
+        return r, g, b
+    end
+end
+
+local function compute_lighting(hit_x, hit_y, hit_z, nx, ny, nz, view_x, view_y, view_z, light_x, light_y, light_z, enable_shadow)
+    local dir_x = light_x - hit_x
+    local dir_y = light_y - hit_y
+    local dir_z = light_z - hit_z
+    
+    local dot = nx*dir_x + ny*dir_y + nz*dir_z
+    if dot <= 0 then return 0, 0 end
+    
+    local light_dist_sq = dir_x*dir_x + dir_y*dir_y + dir_z*dir_z
+    if light_dist_sq < 1e-6 then return 0, 0 end
+    
+    local light_dist = m_sqrt(light_dist_sq)
+    local inv_dist = 1 / light_dist
+    dir_x = dir_x * inv_dist
+    dir_y = dir_y * inv_dist
+    dir_z = dir_z * inv_dist
+    
+    local diff = dot * inv_dist
+
+    -- ОПТИМИЗАЦИЯ: Ранний выход для теней (не трассируем лучи, если свет слишком далеко)
+    if enable_shadow and light_dist_sq < 1000000 then
+        local ox = hit_x + nx * 0.2
+        local oy = hit_y + ny * 0.2
+        local oz = hit_z + nz * 0.2
+
+        sh_tr_start_vec.x = ox; sh_tr_start_vec.y = oy; sh_tr_start_vec.z = oz
+        sh_tr_endpos_vec.x = ox + dir_x * light_dist
+        sh_tr_endpos_vec.y = oy + dir_y * light_dist
+        sh_tr_endpos_vec.z = oz + dir_z * light_dist
+
+        local shadow_tr = util_TraceLine(sh_tr_data)
+        if shadow_tr.Hit then return 0, 0 end
+    end
+    
+    local refx = 2*diff*nx - dir_x
+    local refy = 2*diff*ny - dir_y
+    local refz = 2*diff*nz - dir_z
+    local spec_dot = view_x*refx + view_y*refy + view_z*refz
+    local spec = spec_dot > 0 and (spec_dot ^ specular_power) or 0
+    
+    return diff, spec
+end
+
+local function shade_primary(dx, dy, dz, light_x, light_y, light_z, is_realtime)
+    local len = m_sqrt(dx*dx + dy*dy + dz*dz)
+    local nx, ny, nz, hx, hy, hz, tex = trace_map(lcx, lcy, lcz, dx, dy, dz, len)
+
+    if nx then
+        local inv_len = 1 / len
+        local vx, vy, vz = -dx * inv_len, -dy * inv_len, -dz * inv_len
+        
+        local diff, spec = compute_lighting(hx, hy, hz, nx, ny, nz, vx, vy, vz, light_x, light_y, light_z, true)
+        local brightness = diff * (1 + specular_strength * spec)
+
+        local map_r, map_g, map_b = get_map_color(hx, hy, hz, tex)
+        local r = map_r * brightness
+        local g = map_g * brightness
+        local b = map_b * brightness
+
+        if reflectivity > 0 and not is_realtime then
+            local dnx = dx * inv_len
+            local dny = dy * inv_len
+            local dnz = dz * inv_len
+            local dot_dn = dnx*nx + dny*ny + dnz*nz
+            
+            local rx = dnx - 2*dot_dn*nx
+            local ry = dny - 2*dot_dn*ny
+            local rz = dnz - 2*dot_dn*nz
+
+            local refl_ox = hx + nx * 0.3
+            local refl_oy = hy + ny * 0.3
+            local refl_oz = hz + nz * 0.3
+
+            local rt_nx, rt_ny, rt_nz, rt_hx, rt_hy, rt_hz, rt_tex = trace_map(refl_ox, refl_oy, refl_oz, rx, ry, rz, 1)
+
+            local refl_r, refl_g, refl_b
+            if rt_nx then
+                local refl_diff, refl_spec = compute_lighting(rt_hx, rt_hy, rt_hz, rt_nx, rt_ny, rt_nz, -rx, -ry, -rz, light_x, light_y, light_z, not is_realtime)
+                local refl_brightness = refl_diff * (1 + specular_strength * refl_spec)
+                local r_base, g_base, b_base = get_map_color(rt_hx, rt_hy, rt_hz, rt_tex)
+                refl_r = r_base * refl_brightness
+                refl_g = g_base * refl_brightness
+                refl_b = b_base * refl_brightness
+            else
+                refl_r, refl_g, refl_b = 20, 20, 28
+            end
+
+            local inv_refl = 1 - reflectivity
+            r = r * inv_refl + refl_r * reflectivity
+            g = g * inv_refl + refl_g * reflectivity
+            b = b * inv_refl + refl_b * reflectivity
+        end
+
+        return r, g, b
+    end
+
+    return 20, 20, 28
+end
+
+-- ==================== СУПЕР-РЕНДЕР (HQ) ====================
+
+local function create_render_coroutine(snap)
+    local s = snap
+    local total_y = s.res_y
+    local inv_res_x = 2 / s.res_x
+    local inv_res_y = 2 / s.res_y
+    local aa_samples = s.aa_samples
+    local lx, ly, lz = s.light_x, s.light_y, s.light_z
+
+    local function row_renderer()
+        for y = 0, total_y-1 do
+            local v = -(y * inv_res_y) + 1
+            local row_start_dx = s.wr0_x + v * s.up_x - s.right_x
+            local row_start_dy = s.wr0_y + v * s.up_y - s.right_y
+            local row_start_dz = s.wr0_z + v * s.up_z - s.right_z
+
+            local spans = hq_spans_buffer
+            local span_idx = 1
+            
+            local start_x = -1
+            local last_r, last_g, last_b = -1, -1, -1
+
+            for x = 0, s.res_x-1 do
+                local base_dx = row_start_dx + x * s.step_x
+                local base_dy = row_start_dy + x * s.step_y
+                local base_dz = row_start_dz + x * s.step_z
+
+                local sum_r, sum_g, sum_b = 0, 0, 0
+                local total_samples = aa_samples * aa_samples
+                
+                for sy = 0, aa_samples-1 do
+                    local fy = (sy + 0.5) / aa_samples
+                    for sx = 0, aa_samples-1 do
+                        local fx = (sx + 0.5) / aa_samples
+                        
+                        local ldx = base_dx + fx * s.step_x + fy * (-s.up_x * inv_res_y)
+                        local ldy = base_dy + fx * s.step_y + fy * (-s.up_y * inv_res_y)
+                        local ldz = base_dz + fx * s.step_z + fy * (-s.up_z * inv_res_y)
+
+                        local r, g, b = shade_primary(ldx, ldy, ldz, lx, ly, lz, false)
+                        sum_r = sum_r + r; sum_g = sum_g + g; sum_b = sum_b + b
+                    end
+                end
+                
+                local ir = m_floor(sum_r / total_samples)
+                local ig = m_floor(sum_g / total_samples)
+                local ib = m_floor(sum_b / total_samples)
+                
+                if ir > 255 then ir = 255 elseif ir < 0 then ir = 0 end
+                if ig > 255 then ig = 255 elseif ig < 0 then ig = 0 end
+                if ib > 255 then ib = 255 elseif ib < 0 then ib = 0 end
+
+                if ir ~= last_r or ig ~= last_g or ib ~= last_b then
+                    if start_x ~= -1 then
+                        spans[span_idx] = start_x
+                        spans[span_idx+1] = x - start_x
+                        spans[span_idx+2] = last_r
+                        spans[span_idx+3] = last_g
+                        spans[span_idx+4] = last_b
+                        span_idx = span_idx + 5
+                    end
+                    last_r, last_g, last_b = ir, ig, ib
+                    start_x = x
+                end
+            end
+            
+            if start_x ~= -1 then
+                spans[span_idx] = start_x
+                spans[span_idx+1] = s.res_x - start_x
+                spans[span_idx+2] = last_r
+                spans[span_idx+3] = last_g
+                spans[span_idx+4] = last_b
+                span_idx = span_idx + 5
+            end
+
+            for i = span_idx, #spans do spans[i] = nil end
+            coroutine.yield(y, spans)
+        end
+    end
+    return coroutine.create(row_renderer)
+end
+
+-- ==================== VGUI ПАНЕЛЬ ====================
+
+local RTXPanel = vgui.Create("Panel")
+RTXPanel:ParentToHUD()
+RTXPanel:SetSize(ScrW(), ScrH())
+RTXPanel:SetZPos(-100)
+
+function RTXPanel:Think()
+    local ply = LocalPlayer()
+    if not IsValid(ply) then return end
+
+    local eyePos = ply:EyePos()
+    local eyeAngles = ply:EyeAngles()
+    
+    cam_x, cam_y, cam_z = eyePos.x, eyePos.y, eyePos.z
+    lcx, lcy, lcz = cam_x, cam_y, cam_z
+
+    local fwd = eyeAngles:Forward()
+    local right = eyeAngles:Right()
+    local up = eyeAngles:Up()
+
+    cam_forward_x, cam_forward_y, cam_forward_z = fwd.x, fwd.y, fwd.z
+    cam_right_x, cam_right_y, cam_right_z = right.x, right.y, right.z
+    cam_up_x, cam_up_y, cam_up_z = up.x, up.y, up.z
+
+    if not rt then
+        local rt_name = "FixedMapRT_" .. RES_X .. "x" .. RES_Y
+        rt = GetRenderTarget(rt_name, RES_X, RES_Y)
+        mat = CreateMaterial("FixedMapMat_" .. RES_X .. "x" .. RES_Y, "UnlitGeneric", {
+            ["$basetexture"] = rt_name,
+            ["$vertexcolor"] = 1, ["$vertexalpha"] = 1, ["$translucent"] = 1
+        })
+    end
+
+    local time = 1
+    current_light_x = cam_x + m_sin(time) * 350
+    current_light_y = cam_y + m_cos(time) * 350
+    current_light_z = cam_z + 150
+
+    if g_render.requested then
+        g_render.requested = false
+        local snap = {}
+        snap.res_x, snap.res_y = HIGH_RES_X, HIGH_RES_Y
+        snap.light_x, snap.light_y, snap.light_z = current_light_x, current_light_y, current_light_z
+        snap.wr0_x, snap.wr0_y, snap.wr0_z = focal_length * cam_forward_x, focal_length * cam_forward_y, focal_length * cam_forward_z
+        snap.up_x, snap.up_y, snap.up_z = cam_up_x, cam_up_y, cam_up_z
+        snap.right_x, snap.right_y, snap.right_z = cam_right_x, cam_right_y, cam_right_z
+        local inv_res_x = 2 / HIGH_RES_X
+        snap.step_x = cam_right_x * inv_res_x
+        snap.step_y = cam_right_y * inv_res_x
+        snap.step_z = cam_right_z * inv_res_x
+        snap.aa_samples = m_Clamp(rtx_aa_samples_var:GetInt(), 1, 4)
+
+        g_render.rt = GetRenderTarget("HQMapRT_" .. HIGH_RES_X .. "x" .. HIGH_RES_Y, HIGH_RES_X, HIGH_RES_Y)
+        g_render.mat = CreateMaterial("HQMapMat_" .. HIGH_RES_X .. "x" .. HIGH_RES_Y, "UnlitGeneric", {
+            ["$basetexture"] = "HQMapRT_" .. HIGH_RES_X .. "x" .. HIGH_RES_Y,
+            ["$vertexcolor"] = 1, ["$vertexalpha"] = 1, ["$translucent"] = 1
+        })
+        g_render.co = create_render_coroutine(snap)
+        g_render.active = true
+        g_render.rows_done = 0
+        g_render.finished = false
+    end
+end
+
+function RTXPanel:Paint(w, h)
+    -- ==================== 1. РЕНДЕРИНГ В ТАРГЕТЫ ====================
+    if g_render.active and g_render.co then
+        local time_budget = 0.02
+        local start_time = SysTime()
+        
+        render_PushRenderTarget(g_render.rt)
+        cam_Start2D()
+
+        while true do
+            local status, y, spans = coroutine.resume(g_render.co)
+            
+            if not status or y == nil then
+                g_render.finished = true
+                g_render.active = false
+                cam_End2D()
+                render_PopRenderTarget()
+                
+                local viewer = vgui.Create("DFrame")
+                viewer:SetSize(ScrW()*0.8, ScrH()*0.8)
+                viewer:Center()
+                viewer:SetTitle("Ultra RTX Result")
+                viewer:MakePopup()
+                local img = vgui.Create("DImage", viewer)
+                img:SetMaterial(g_render.mat)
+                img:Dock(FILL)
+                break
+            end
+            
+            local i = 1
+            while i <= #spans do
+                surface_SetDrawColor(spans[i+2], spans[i+3], spans[i+4], 255)
+                surface_DrawRect(spans[i], y, spans[i+1], 1)
+                i = i + 5
+            end
+            
+            g_render.rows_done = g_render.rows_done + 1
+            
+            if SysTime() - start_time > time_budget then
+                cam_End2D()
+                render_PopRenderTarget()
+                break
+            end
+        end
+    end
+
+    -- PATH TRACING РЕНДЕР
+    if rt then
+        local wr0_base_x, wr0_base_y, wr0_base_z = focal_length * cam_forward_x, focal_length * cam_forward_y, focal_length * cam_forward_z
+        local inv_res_x = 2 / RES_X
+        local inv_res_y = 2 / RES_Y
+        local lstep_x, lstep_y, lstep_z = cam_right_x * inv_res_x, cam_right_y * inv_res_x, cam_right_z * inv_res_x
+
+        render_PushRenderTarget(rt)
+        cam_Start2D()
+
+        -- ЗАТЕМНЕНИЕ ИСТОРИИ (Temporal Fade)
+        surface_SetDrawColor(0, 0, 0, 25) 
+        surface_DrawRect(0, 0, RES_X, RES_Y)
+
+        -- ТРАССИРОВКА
+        local frame_num = FrameNumber()
+        local offset_x = frame_num % 2
+        local offset_y = m_floor(frame_num / 2) % 2
+        local last_r, last_g, last_b = -1, -1, -1
+
+        for y = offset_y, RES_Y - 1, 2 do
+            local v = -(y * inv_res_y) + 1
+            local ldx_start = wr0_base_x + v * cam_up_x - cam_right_x
+            local ldy_start = wr0_base_y + v * cam_up_y - cam_right_y
+            local ldz_start = wr0_base_z + v * cam_up_z - cam_right_z
+
+            for x = offset_x, RES_X - 1, 2 do
+                -- Достаем шум из таблицы
+                local jx = jitter_table[j_idx] * lstep_x
+                local jy = jitter_table[j_idx+1] * lstep_y
+                local jz = jitter_table[j_idx+2] * lstep_z
+                
+                j_idx = j_idx + 3
+                if j_idx > 1020 then j_idx = 1 end
+
+                local ldx = ldx_start + x * lstep_x + jx
+                local ldy = ldy_start + x * lstep_y + jy
+                local ldz = ldz_start + x * lstep_z + jz
+
+                local r, g, b = shade_primary(ldx, ldy, ldz, current_light_x, current_light_y, current_light_z, true)
+                
+                local ir = r < 0 and 0 or (r > 255 and 255 or m_floor(r))
+                local ig = g < 0 and 0 or (g > 255 and 255 or m_floor(g))
+                local ib = b < 0 and 0 or (b > 255 and 255 or m_floor(b))
+
+                -- Меняем цвет только при его изменении
+                if ir ~= last_r or ig ~= last_g or ib ~= last_b then
+                    surface_SetDrawColor(ir, ig, ib, 255)
+                    last_r, last_g, last_b = ir, ig, ib
+                end
+
+                surface_DrawRect(x, y, 1, 1)
+            end
+        end
+
+        cam_End2D()
+        render_PopRenderTarget()
+    end
+
+    -- ==================== 2. ОТРИСОВКА НА ЭКРАН ====================
+    if mat then
+        surface_SetDrawColor(255, 255, 255, 255)
+        surface_SetMaterial(mat)
+        surface_DrawTexturedRect(0, 0, w, h)
+    end
+
+    draw_SimpleText("FPS: " .. m_floor(1/FrameTime()), "DebugFont", 15, 15, Color(0, 255, 0))
+    if g_render.active then
+        draw_SimpleText("Фоновый рендер HQ: " .. g_render.rows_done .. "/" .. HIGH_RES_Y, "DebugFont", 15, 35, Color(255, 128, 0))
+    end
+end
